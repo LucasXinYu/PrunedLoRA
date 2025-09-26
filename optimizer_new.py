@@ -1,44 +1,74 @@
 import torch
 from torch.optim import AdamW
 
+import torch
+
 def prune_weight_matrix_prunedlora(weight_A, weight_B, grad_A, grad_B, mask, k=5):
+    """
+    Structured pruning for LoRA matrices (A, B) with update step (PrunedLoRA).
+    weight_A: torch.Tensor [r, d]  (LoRA A matrix)
+    weight_B: torch.Tensor [d, r]  (LoRA B matrix)
+    grad_A:   torch.Tensor [r, d]  (gradient wrt A)
+    grad_B:   torch.Tensor [d, r]  (gradient wrt B)
+    mask:     torch.BoolTensor [r] (which columns are active)
+    k:        number of columns to prune
+    """
     WB = weight_B.clone()
     WA = weight_A.clone()
     GB = grad_B.clone() if grad_B is not None else torch.zeros_like(WB)
     GA = grad_A.clone() if grad_A is not None else torch.zeros_like(WA)
+
     mask_new = mask.to(dtype=torch.bool).clone()
     WB[:, ~mask_new] = 0.0
     WA[~mask_new, :] = 0.0
     GB[:, ~mask_new] = 0.0
     GA[~mask_new, :] = 0.0
+
     candidate_indices = mask_new.nonzero(as_tuple=False).squeeze(1).tolist()
     if len(candidate_indices) <= k:
         return mask_new, WA, WB
+
     WB_sub = WB[:, candidate_indices]
     WA_sub = WA[candidate_indices, :]
     GB_sub = GB[:, candidate_indices]
     GA_sub = GA[candidate_indices, :]
+
     HB_sub = GB_sub.T @ GB_sub
     HA_sub = GA_sub @ GA_sub.T
-    HB_inv = torch.linalg.pinv(HB_sub + 1e-6 * torch.eye(HB_sub.shape[0], device=HB_sub.device))
-    HA_inv = torch.linalg.pinv(HA_sub + 1e-6 * torch.eye(HA_sub.shape[0], device=HA_sub.device))
+    eps = 1e-6
+    HB_inv = torch.linalg.pinv(HB_sub + eps * torch.eye(HB_sub.shape[0], device=HB_sub.device))
+    HA_inv = torch.linalg.pinv(HA_sub + eps * torch.eye(HA_sub.shape[0], device=HA_sub.device))
+
     scores = []
     Wproj_B = GB_sub @ HB_inv
     Wproj_A = HA_inv @ GA_sub
     for local_i, j in enumerate(candidate_indices):
         rB_j = WB_sub[:, local_i] - Wproj_B[:, local_i]
         rA_j = WA_sub[local_i, :] - Wproj_A[local_i, :]
-        HBjj_inv = HB_inv[local_i, local_i] + 1e-6
-        HAjj_inv = HA_inv[local_i, local_i] + 1e-6
+        HBjj_inv = HB_inv[local_i, local_i] + eps
+        HAjj_inv = HA_inv[local_i, local_i] + eps
         score = 0.5 * (rB_j @ rB_j) / HBjj_inv + 0.5 * (rA_j @ rA_j) / HAjj_inv
         scores.append((score.item(), local_i, j))
+
     scores.sort(key=lambda x: x[0])
     prune_list = scores[:k]
     prune_global = [x[2] for x in prune_list]
-    for j in prune_global:
+    prune_local = [x[1] for x in prune_list]
+
+    for local_i, j in zip(prune_local, prune_global):
+        gB_j = GB_sub[:, local_i]
+        gA_j = GA_sub[local_i, :]
+
+        delta_B = - HB_inv @ gB_j
+        delta_A = - gA_j @ HA_inv
+
+        WB[:, mask_new] += delta_B.unsqueeze(1)
+        WA[mask_new, :] += delta_A.unsqueeze(0)
+
         WB[:, j] = 0.0
         WA[j, :] = 0.0
         mask_new[j] = False
+
     return mask_new, WA, WB
 
 def prune_weight_matrix_wanda(weight_A, weight_B, act_in, mask, k=5):
@@ -55,28 +85,6 @@ def prune_weight_matrix_wanda(weight_A, weight_B, act_in, mask, k=5):
     weight_B[:, prune_idx] = 0.0
     return mask_new, weight_A, weight_B
 
-def prune_weight_matrix_sparsegpt(weight_A, weight_B, act_in, mask, k=5):
-    WA = weight_A.clone()
-    WB = weight_B.clone()
-    mask_new = mask.to(torch.bool).clone()
-    candidate_indices = mask_new.nonzero(as_tuple=False).squeeze(1).tolist()
-    if len(candidate_indices) <= k:
-        return mask_new, WA, WB
-    X = act_in
-    H = (X.T @ X) / X.shape[0] + 1e-6 * torch.eye(X.shape[1], device=X.device)
-    H_inv = torch.linalg.pinv(H)
-    scores = []
-    for j in candidate_indices:
-        wA_j = WA[j, :]
-        score = (wA_j @ H_inv @ wA_j.T).item()
-        scores.append((score, j))
-    scores.sort(key=lambda x: x[0])
-    prune_global = [x[1] for x in scores[:k]]
-    for j in prune_global:
-        WA[j, :] = 0.0
-        WB[:, j] = 0.0
-        mask_new[j] = False
-    return mask_new, WA, WB
 
 def prune_weight_matrix_llmpruner(weight_A, weight_B, grad_A, grad_B, mask, k=5, variant="element1"):
     WA = weight_A.clone()
