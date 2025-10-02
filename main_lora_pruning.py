@@ -29,6 +29,7 @@ import math
 import os
 import sys
 from accelerate import Accelerator
+import torch.distributed as dist
 
 # pwd = '' # You should provice the work directory. 
 # sys.path = [os.path.abspath(os.path.join(os.getcwd(), " "))] + sys.path
@@ -56,7 +57,7 @@ from transformers import (
     default_data_collator,
     set_seed,
 )
-from transformers.testing_utils import CaptureLogger
+# from transformers.testing_utils import CaptureLogger
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -80,6 +81,37 @@ from huggingface_hub import login, HfApi, create_repo
 import wandb
 
 
+#######
+# --- Fallback CaptureLogger to avoid pytest dependency breakages ---
+import io, logging
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+@contextmanager
+def CaptureLogger(logger: logging.Logger):
+    """
+    Minimal drop-in replacement for transformers.testing_utils.CaptureLogger.
+    Usage:
+        with CaptureLogger(logger) as cl:
+            ...
+        # cl.out contains the captured log text
+    """
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    logger.addHandler(handler)
+    prev_level = logger.level
+    try:
+        logger.setLevel(logging.DEBUG)
+        ns = SimpleNamespace(out="")
+        yield ns
+        ns.out = stream.getvalue()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prev_level)
+        stream.close()
+######
+
+
 # Will error if the minimal version of moe_transformers is not installed. Remove at your own risks.
 # check_min_version("4.26.0.dev0")
 sys.setrecursionlimit(30000)
@@ -94,7 +126,11 @@ LLAMA3_CHAT_TEMPLATE = "{% set loop_messages = messages %}{% for message in loop
 LLAMA32_CHAT_TEMPLATE = "{{- bos_token }}\n{%- if custom_tools is defined %}\n    {%- set tools = custom_tools %}\n{%- endif %}\n{%- if not tools_in_user_message is defined %}\n    {%- set tools_in_user_message = true %}\n{%- endif %}\n{%- if not date_string is defined %}\n    {%- if strftime_now is defined %}\n        {%- set date_string = strftime_now(\"%d %b %Y\") %}\n    {%- else %}\n        {%- set date_string = \"26 Jul 2024\" %}\n    {%- endif %}\n{%- endif %}\n{%- if not tools is defined %}\n    {%- set tools = none %}\n{%- endif %}\n\n{#- This block extracts the system message, so we can slot it into the right place. #}\n{%- if messages[0]['role'] == 'system' %}\n    {%- set system_message = messages[0]['content']|trim %}\n    {%- set messages = messages[1:] %}\n{%- else %}\n    {%- set system_message = \"\" %}\n{%- endif %}\n\n{#- System message #}\n{{- \"<|start_header_id|>system<|end_header_id|>\\n\\n\" }}\n{%- if tools is not none %}\n    {{- \"Environment: ipython\\n\" }}\n{%- endif %}\n{{- \"Cutting Knowledge Date: December 2023\\n\" }}\n{{- \"Today Date: \" + date_string + \"\\n\\n\" }}\n{%- if tools is not none and not tools_in_user_message %}\n    {{- \"You have access to the following functions. To call a function, please respond with JSON for a function call.\" }}\n    {{- 'Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.' }}\n    {{- \"Do not use variables.\\n\\n\" }}\n    {%- for t in tools %}\n        {{- t | tojson(indent=4) }}\n        {{- \"\\n\\n\" }}\n    {%- endfor %}\n{%- endif %}\n{{- system_message }}\n{{- \"<|eot_id|>\" }}\n\n{#- Custom tools are passed in a user message with some extra guidance #}\n{%- if tools_in_user_message and not tools is none %}\n    {#- Extract the first user message so we can plug it in here #}\n    {%- if messages | length != 0 %}\n        {%- set first_user_message = messages[0]['content']|trim %}\n        {%- set messages = messages[1:] %}\n    {%- else %}\n        {{- raise_exception(\"Cannot put tools in the first user message when there's no first user message!\") }}\n{%- endif %}\n    {{- '<|start_header_id|>user<|end_header_id|>\\n\\n' -}}\n    {{- \"Given the following functions, please respond with a JSON for a function call \" }}\n    {{- \"with its proper arguments that best answers the given prompt.\\n\\n\" }}\n    {{- 'Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.' }}\n    {{- \"Do not use variables.\\n\\n\" }}\n    {%- for t in tools %}\n        {{- t | tojson(indent=4) }}\n        {{- \"\\n\\n\" }}\n    {%- endfor %}\n    {{- first_user_message + \"<|eot_id|>\"}}\n{%- endif %}\n\n{%- for message in messages %}\n    {%- if not (message.role == 'ipython' or message.role == 'tool' or 'tool_calls' in message) %}\n        {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n'+ message['content'] | trim + '<|eot_id|>' }}\n    {%- elif 'tool_calls' in message %}\n        {%- if not message.tool_calls|length == 1 %}\n            {{- raise_exception(\"This model only supports single tool-calls at once!\") }}\n        {%- endif %}\n        {%- set tool_call = message.tool_calls[0].function %}\n        {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' -}}\n        {{- '{\"name\": \"' + tool_call.name + '\", ' }}\n        {{- '\"parameters\": ' }}\n        {{- tool_call.arguments | tojson }}\n        {{- \"}\" }}\n        {{- \"<|eot_id|>\" }}\n    {%- elif message.role == \"tool\" or message.role == \"ipython\" %}\n        {{- \"<|start_header_id|>ipython<|end_header_id|>\\n\\n\" }}\n        {%- if message.content is mapping or message.content is iterable %}\n            {{- message.content | tojson }}\n        {%- else %}\n            {{- message.content }}\n        {%- endif %}\n        {{- \"<|eot_id|>\" }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}\n{%- endif %}\n",
 
 
-
+# messages = [
+#    {"role": "system", "content": "You are a helpful assistant."},
+#    {"role": "user", "content": "What's 2+2?"},
+#    {"role": "assistant", "content": "The answer is 4."}
+# ]
 
 
 
@@ -264,6 +300,12 @@ class FedArguments:
     save_model_freq: Optional[int] = field(default=50, metadata={"help": "the frequency to save the model. 50 means save every 50 rounds"})
     optim_notes: Optional[str] = field(default="optim_notes", metadata={"help": "the optim_notes of the experiment"})
 
+    # === LoRA related parameters ===
+    use_lora: Optional[bool] = field(default=True, metadata={"help": "Whether to apply LoRA adapters"})
+    lora_alpha: Optional[int] = field(default=16, metadata={"help": "LoRA alpha scaling factor"})
+    lora_rank: Optional[int] = field(default=8, metadata={"help": "LoRA rank"})
+    lora_alt: Optional[bool] = field(default=False, metadata={"help": "Whether to use alternating LoRA training (switch A/B)"})
+
 #####################################################################
 #####################################################################
 def main():
@@ -278,7 +320,7 @@ def main():
 
 
 
-    f_read_token = None
+    f_read_token = 'fill your hf token here'
     hf_write_token = None
     wanda_key = None
     hf_repo_id = "your_project/model_name"
@@ -292,26 +334,41 @@ def main():
     wandb.login(key=wanda_key)
     accelerator = Accelerator()
     
-    lora_alpha = 16
-    lora_rank = 128
+    lora_alpha = fed_args.lora_alpha
+    lora_rank = fed_args.lora_rank
     batchsize = 1
-    lora_alt = False 
+    lora_alt = fed_args.lora_alt
 
 
     print(fed_args.optim_notes)
-    config = dict(
+
+    if fed_args.use_lora:
+        print('[note from config]: parameter efficient fine-tuning')
+        config = dict(
+            model="meta-llama/Meta-Llama-3-8B",
+            d="meta_math",
+            a=lora_alpha,
+            r=lora_rank,
+            s=batchsize,
+            sd=42,
+            optim_name=fed_args.optim_notes,
+            alt=lora_alt,
+            lr=training_args.learning_rate,
+            use_lora=True,
+        )
+        print(config)
+    else:
+        print("[note from config]:LoRA disabled: training dense model parameters only")
+        config = dict(
         model="meta-llama/Meta-Llama-3-8B",
         d="meta_math",
-        a=lora_alpha,
-        r=lora_rank,
         s=batchsize,
         sd=42,
         optim_name=fed_args.optim_notes,
-        alt=lora_alt,
         lr=training_args.learning_rate,
+        use_lora=False,
     )
-    print(config)
-    
+        
     
     wandb_name = "_".join([f"{k}={v}" for k, v in config.items()])
     if accelerator.is_local_main_process:
@@ -344,11 +401,10 @@ def main():
     )
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    # Detecting last checkpoint.
+    # continue training from last checkpoint
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        print('fdasfdasfdafaffsadfdasfdsafasdfdasfdsafasdf')
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
             raise ValueError(
                 f"Output directory ({training_args.output_dir}) already exists and is not empty. "
@@ -360,7 +416,6 @@ def main():
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
 
-    # Set seed before initializing model.
     set_seed(training_args.seed)
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
@@ -374,16 +429,17 @@ def main():
     # download the dataset.
     
     if data_args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(
            data_args.dataset_name,
            data_args.dataset_config_name,
            cache_dir=model_args.cache_dir,
            use_auth_token=True if model_args.use_auth_token else None,
         )        
+        if "train_sft" in raw_datasets and "test_sft" in raw_datasets:
+            raw_datasets["train"] = raw_datasets["train_sft"]
+            raw_datasets["validation"] = raw_datasets["test_sft"]
 
-        # raw_datasets = load_from_disk('/aifs4su/data/zhaohao/wikitext')
-        if "validation" not in raw_datasets.keys():
+        elif "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
                 data_args.dataset_name,
                 data_args.dataset_config_name,
@@ -398,6 +454,7 @@ def main():
                 cache_dir=model_args.cache_dir,
                 use_auth_token=True if model_args.use_auth_token else None,
             )
+  
     else:
         data_files = {}
         dataset_args = {}
@@ -420,7 +477,6 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
             **dataset_args,
         )
-        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
                 extension,
@@ -439,14 +495,9 @@ def main():
                 **dataset_args,
             )
 
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
+
 
     ## Load pretrained model and tokenizer ##
-    #
-    # Distributed training:
-    # The .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
 
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -467,6 +518,10 @@ def main():
 
     setattr(config, 'seed', training_args.seed)
 
+    #
+    # import the tokenizer template #
+    #
+
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
@@ -483,12 +538,17 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+    #support the template with chat
     if "llama-3.2-1b-instruct" in model_args.model_name_or_path.lower():
         pass 
     elif "llama-3.2-" in model_args.model_name_or_path.lower() and "instruct" not in model_args.model_name_or_path.lower():
         tokenizer.chat_template = LLAMA32_CHAT_TEMPLATE
     elif "llama-3-" in model_args.model_name_or_path.lower() and "instruct" not in model_args.model_name_or_path.lower():
         tokenizer.chat_template = LLAMA3_CHAT_TEMPLATE
+
+    #
+    # import the tokenizer template #
+    #
 
     if model_args.model_name_or_path:
         # Set torch dtype and attention implementation
@@ -510,8 +570,7 @@ def main():
         )
         model.config.attn_implementation = attn_implementation
         
-                
-
+            
     else:
         model = AutoModelForCausalLM.from_config(config)
         n_params = sum(dict((p.data_ptr(), p.numel()) for p in model.parameters()).values())
@@ -523,77 +582,131 @@ def main():
     print(f"Number of layers (parameter sets) in the model: {num_layers}")
 
     print(f'max_gate_samples is {data_args.max_gate_samples}')
-    lora_config = LoraConfig(peft_type=PeftType.LORA, r=lora_rank, lora_alpha=lora_alpha, task_type=TaskType.CAUSAL_LM, lora_dropout=0.05,
-                             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],) ## further to revise
-    
-    
-    
-    model = get_peft_model(model, lora_config)
 
-    import time
 
-    for name, module in model.named_modules():
+    # create lora model or not
+    if fed_args.use_lora:
+
+
+        print("[config]: Using LoRA fine-tuning")
+        lora_config = LoraConfig(
+            peft_type=PeftType.LORA,
+            r=fed_args.lora_rank,
+            lora_alpha=fed_args.lora_alpha,
+            task_type=TaskType.CAUSAL_LM,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  
+        )
+        model = get_peft_model(model, lora_config)
+        
+        import time
+        for name, module in model.named_modules():
+            if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+                for adapter_name, B in module.lora_B.items():
+                    A = module.lora_A[adapter_name]
+                    r = B.weight.shape[1]   # rank
+                    module.register_buffer("mask", torch.ones(r), persistent=False) 
+                    print(f"Added mask to {name}, shape={module.mask.shape}")
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(model)
+        time.sleep(10)
+            
+        model.enable_input_require_grads()
+        # model.gradient_checkpointing_enable()
+        model.print_trainable_parameters()
+
+    else:
+        print("[config]: Training dense model (no LoRA)")
+        model.enable_input_require_grads()
+        model.gradient_checkpointing_enable()
+        
+
+    def save_input_hook(module, input, output):
+        module.act_in = input[0].detach().clone()
+    # obtain the activation value for activation-based pruning 
+    for module in model.modules():
         if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
-            for adapter_name, B in module.lora_B.items():
-                A = module.lora_A[adapter_name]
-                r = B.weight.shape[1]   # rank
-                module.register_buffer("mask", torch.ones(r), persistent=False) 
-                print(f"Added mask to {name}, shape={module.mask.shape}")
-    print(model)
-    
-    time.sleep(100)
+            module.register_forward_hook(save_input_hook)
 
-    model.enable_input_require_grads()
-    # model.gradient_checkpointing_enable()
+        
 
-    model.print_trainable_parameters()
 
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
+
+
+
+
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
-    # Preprocessing the datasets.
-    # First we tokenize all the texts.
     if training_args.do_train:
         column_names = list(raw_datasets["train"].features)
         print(column_names)
-        #column_names = raw_datasets["train"].column_names
     else:
         column_names = list(raw_datasets["validation"].features)
-        #column_names = raw_datasets["validation"].column_names
-    # text_column_name = "input" if "input" in column_names else column_names[-1]
-    # print(text_column_name)
-    # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
     tok_logger = transformers.utils.logging.get_logger("moe_transformers.tokenization_utils_base")
     
+
+    # tokenizer function 
     def tokenize_function(examples):
-        with CaptureLogger(tok_logger) as cl:
-            if data_args.dataset_name == "meta-math/MetaMathQA":
-                prompts = [
-                    f"Question: {query} </s> Answer: "
-                    for query in examples["query"]
-                ]
-                outputs = examples["response"]
-                full_texts = [prompt + output for prompt, output in zip(prompts, outputs)]
-            
-            tokenized_full = tokenizer(full_texts)
-            tokenized_prompts = tokenizer(prompts)
-            labels = [ids.copy() for ids in tokenized_full["input_ids"]]
-            for i, prompt_ids in enumerate(tokenized_prompts["input_ids"]):
-                prompt_length = len(prompt_ids)
-                labels[i][:prompt_length] = [-100] * prompt_length
-            tokenized_full["labels"] = labels
-        # clm input could be much much longer than block_size
-        if "Token indices sequence length is longer than the" in cl.out:
-            tok_logger.warning(
-                "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
-                " before being passed to the model."
-            )
+
+        print("==== Raw examples before tokenization ====")
+        for key, value in examples.items():
+            print(f"[sample example]:{key}: {value[:1]}")  
+        print("==========================================")
+
+
+
+        dataset_name = data_args.dataset_name.lower()
+        prompts = []
+        outputs = []
+
+        if "meta-math" in dataset_name or "gsm8k" in dataset_name:
+            # === math ===
+            prompts = [f"Question: {q} </s> Answer: " for q in examples["query"]]
+            outputs = examples["response"]
+
+        elif "humaneval" in dataset_name:
+            # === code ===
+            prompts = [p for p in examples["prompt"]]
+            outputs = examples["canonical_solution"]
+
+        elif "code-feedback" in dataset_name:
+            prompts = []
+            outputs = []
+
+            for msgs in examples["messages"]:
+                if len(msgs) < 2:
+                    continue
+                prompt = ""
+                for m in msgs[:-1]:
+                    if m["role"] in ["user", "system"]:
+                        prompt += f"{m['role'].capitalize()}: {m['content']}\n"
+                prompts.append(prompt)
+                outputs.append(msgs[-1]["content"])
+            print('tokenizer finished - code-feedback')
+
+
+        else:
+            full_texts = examples["text"]
+            tokenized = tokenizer(full_texts, truncation=True, max_length=data_args.block_size)
+            tokenized["labels"] = tokenized["input_ids"].copy()
+            return tokenized
+
+
+        full_texts = [p + o for p, o in zip(prompts, outputs)]
+        tokenized_full = tokenizer(full_texts, truncation=True, max_length=data_args.block_size)
+        tokenized_prompts = tokenizer(prompts, truncation=True, max_length=data_args.block_size)
+
+        labels = [ids.copy() for ids in tokenized_full["input_ids"]]
+        for i, prompt_ids in enumerate(tokenized_prompts["input_ids"]):
+            prompt_length = len(prompt_ids)
+            labels[i][:prompt_length] = [-100] * prompt_length 
+        tokenized_full["labels"] = labels
+
         return tokenized_full
+
     
-    #print(len(raw_datasets['train']))
-    #exit()
 
     # Set the FL dataset
     if data_args.max_train_samples is not None:
@@ -862,5 +975,4 @@ def _mp_fn(index):
 
 if __name__ == "__main__":
     main()
-
 
