@@ -1,0 +1,13 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: bf16
+num_processes: 8
+num_machines: 1
+machine_rank: 0
+fsdp_config:
+  fsdp_strategy: "full_shard auto_wrap"
+  sharding_strategy: 1          
+  min_num_params: 1e8         
+  offload_params: false
+  offload_optimizer: false
+  auto_wrap_policy: TRANSFORMER_BASED_WRAP
