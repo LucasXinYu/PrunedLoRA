@@ -138,26 +138,30 @@ class LogTrainer(Trainer):
             gradient_accumulation = self.args.gradient_accumulation_steps
             epoch_steps = len(self.train_dataset) // train_batch_size
             num_training_steps = epoch_steps * self.args.num_train_epochs // gradient_accumulation
+        
         num_warmup_steps = self.args.get_warmup_steps(num_training_steps)
-        elif self.pruning_method in ["sparsegpt", "wanda", "llmpruner", "prunedlora"]:
+
+        if self.pruning_method in ["sparsegpt", "wanda", "llmpruner", "prunedlora"]:
             optimizer = AdamWWithPruning(
-                self.model,
-                lr=self.lr,
-                betas=(0.9, 0.999),
-                eps=1e-4,
-                weight_decay=1e-5,
-                prune_every=10,  
-                prune_k=2, 
-                self.pruning_method
-            )
-        elif self.pruning_method == "Adamw":
+                        self.model,
+                        lr=self.lr,
+                        betas=(0.9, 0.999),
+                        eps=1e-4,
+                        weight_decay=1e-5,
+                        prune_every=10,  
+                        prune_k=2,
+                        pruning_method = self.pruning_method
+                    )
+        elif self.pruning_method == "Adamw" or not self.pruning_method :
             optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
+        
         scheduler = get_scheduler(
-            name = self.args.lr_scheduler_type,  
-            optimizer=optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps,
-        )
+                name = self.args.lr_scheduler_type,  
+                optimizer=optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps,
+                )
+       
         self.optimizer = optimizer
         self.lr_scheduler = scheduler
         return optimizer, scheduler
@@ -167,7 +171,7 @@ class LogTrainer(Trainer):
             model,
             inputs,
             return_outputs=False,
-            num_items_in_batch: int = None,   # 新增参数
+            num_items_in_batch: int = None,  
         ):
         outputs = model(**inputs)
         loss = outputs.loss
@@ -187,7 +191,7 @@ class LogTrainer(Trainer):
     self,
     model: nn.Module,
     inputs: dict[str, Union[torch.Tensor, Any]],
-    num_items_in_batch: int = None,   # 新增参数，默认 None 保证兼容
+    num_items_in_batch: int = None, 
     ) -> torch.Tensor:
         if not do_log:        
             if self.alt is True:
@@ -244,7 +248,7 @@ class LogTrainer(Trainer):
             loss = self.compute_loss(model, inputs)
 
         if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+            loss = loss.mean()  
 
         self.accelerator.backward(loss)
 
