@@ -219,7 +219,13 @@ def main():
 
     # ===== Optimizer =====
     # ===== Optimizer =====
-    optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate)
+    optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=training_args.learning_rate,
+    weight_decay=training_args.weight_decay,
+    betas=(0.9, 0.95),  
+    eps=1e-8            
+    )
 
     # ===== Scheduler =====
     num_update_steps_per_epoch = len(train_dataloader)
@@ -243,36 +249,67 @@ def main():
 
 
     # ===== Training loop =====
-    # ===== Training loop =====
     model.train()
     global_step = 0
     max_steps = training_args.max_steps if training_args.max_steps > 0 else None
+
+    training_args.num_train_epochs = 10
 
     for epoch in range(int(training_args.num_train_epochs)):
         for step, batch in enumerate(train_dataloader):
             outputs = model(**batch)
             loss = outputs.loss
             accelerator.backward(loss)
+
+            grad_norm = None
+            total_norm = 0.0
+            parameters = [p for p in model.parameters() if p.grad is not None]
+            if len(parameters) > 0:
+                total_norm = torch.norm(
+                    torch.stack([
+                        torch.norm(p.grad.detach(), 2).to(torch.float32)
+                        for p in parameters
+                    ]),
+                    2
+                ).item()
+                grad_norm = total_norm
+
             optimizer.step()
-            lr_scheduler.step()   
+            lr_scheduler.step()
             optimizer.zero_grad()
             global_step += 1
 
             if accelerator.is_local_main_process and global_step % 10 == 0:
-                print(f"Epoch {epoch}, Step {global_step}, Loss {loss.item()}")
+                current_lr = optimizer.param_groups[0]["lr"]
+                if grad_norm is not None:
+                    print(f"Epoch {epoch}, Step {global_step}, "
+                          f"Loss {loss.item():.4f}, "
+                          f"GradNorm {grad_norm:.4f}, "
+                          f"LR {current_lr:.6e}")
+                else:
+                    print(f"Epoch {epoch}, Step {global_step}, "
+                          f"Loss {loss.item():.4f}, "
+                          f"LR {current_lr:.6e}")
 
             if max_steps is not None and global_step >= max_steps:
                 print(f"Reached max_steps={max_steps}, stopping training.")
                 break
-        if max_steps is not None and global_step >= max_steps:
-            break
 
     # ===== Save =====
-    if accelerator.is_local_main_process:
+    accelerator.wait_for_everyone()   # <— make sure all ranks finished training steps
+    if accelerator.is_main_process:
         unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(training_args.output_dir, save_function=accelerator.save)
+        unwrapped_model.save_pretrained(training_args.output_dir,
+                                        save_function=accelerator.save)
         tokenizer.save_pretrained(training_args.output_dir)
+    accelerator.wait_for_everyone()   # <— make sure non-zero ranks wait for rank0 to finish IO
 
+    # Optional: free GPU memory before NCCL teardown
+    accelerator.free_memory()
+
+    # Tell Accelerate you're done (orders the shutdown)
+    accelerator.end_training()
 
 if __name__ == "__main__":
     main()
+
