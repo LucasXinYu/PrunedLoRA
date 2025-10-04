@@ -74,17 +74,24 @@ def prune_weight_matrix_prunedlora(weight_A, weight_B, grad_A, grad_B, mask, k=5
 def prune_weight_matrix_wanda(weight_A, weight_B, act_in, mask, k=5):
     mask_new = mask.clone()
     candidate_indices = mask_new.nonzero(as_tuple=False).squeeze(1).tolist()
-    if len(candidate_indices) <= k:
-        return mask_new, weight_A, weight_B
-    act_proj = torch.norm(weight_A @ act_in.T, dim=1) / act_in.shape[0]
-    weight_norm = torch.norm(weight_B, dim=0)
+    dtype = act_in.dtype
+    act_proj = torch.norm(
+        act_in @ weight_A.to(dtype).T,
+        dim=0
+    ) / act_in.shape[0]
+    weight_norm = torch.norm(weight_B.to(dtype), dim=0)
+
+
     scores = act_proj * weight_norm
     prune_idx = torch.argsort(scores)[:k]
+
     mask_new[prune_idx] = False
     weight_A[prune_idx, :] = 0.0
     weight_B[:, prune_idx] = 0.0
-    return mask_new, weight_A, weight_B
 
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        print(f"[Rank0] Remaining mask count: {mask_new.sum().item()}")
+    return mask_new, weight_A, weight_B
 
 def prune_weight_matrix_llmpruner(weight_A, weight_B, grad_A, grad_B, mask, k=5, variant="element1"):
     WA = weight_A.clone()
