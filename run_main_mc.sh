@@ -13,6 +13,10 @@ max_gate_samples=50
 max_train_samples=100000
 do_train=True
 
+# dataset_name = "meta-math/MetaMathQA"
+# dataset_config_name = None
+
+
 model_name_or_path="meta-llama/Meta-Llama-3-8B"
 tokenizer_name="meta-llama/Meta-Llama-3-8B"
 
