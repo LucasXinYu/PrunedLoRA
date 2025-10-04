@@ -306,8 +306,8 @@ class FedArguments:
     lora_rank: Optional[int] = field(default=8, metadata={"help": "LoRA rank"})
     lora_alt: Optional[bool] = field(default=False, metadata={"help": "Whether to use alternating LoRA training (switch A/B)"})
 
-#####################################################################
-#####################################################################
+
+
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, FedArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -518,9 +518,6 @@ def main():
 
     setattr(config, 'seed', training_args.seed)
 
-    #
-    # import the tokenizer template #
-    #
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -545,10 +542,6 @@ def main():
         tokenizer.chat_template = LLAMA32_CHAT_TEMPLATE
     elif "llama-3-" in model_args.model_name_or_path.lower() and "instruct" not in model_args.model_name_or_path.lower():
         tokenizer.chat_template = LLAMA3_CHAT_TEMPLATE
-
-    #
-    # import the tokenizer template #
-    #
 
     if model_args.model_name_or_path:
         # Set torch dtype and attention implementation
@@ -586,8 +579,6 @@ def main():
 
     # create lora model or not
     if fed_args.use_lora:
-
-
         print("[config]: Using LoRA fine-tuning")
         lora_config = LoraConfig(
             peft_type=PeftType.LORA,
@@ -624,6 +615,7 @@ def main():
 
     def save_input_hook(module, input, output):
         module.act_in = input[0].detach().clone()
+        
     # obtain the activation value for activation-based pruning 
     for module in model.modules():
         if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
@@ -649,14 +641,6 @@ def main():
 
     # tokenizer function 
     def tokenize_function(examples):
-
-        print("==== Raw examples before tokenization ====")
-        for key, value in examples.items():
-            print(f"[sample example]:{key}: {value[:1]}")  
-        print("==========================================")
-
-
-
         dataset_name = data_args.dataset_name.lower()
         prompts = []
         outputs = []
@@ -912,15 +896,9 @@ def main():
                 trainer.save_metrics("eval", metrics)
 
                 val_loss.append(metrics["eval_loss"])
-        ##########################################################################################
-    ##########################################################################################
-    ##########################################################################################
-    
-        
-        print("\n========== MODEL STRUCTURE ==========")
-        print(model)
 
-        print("\n========== TRAINABLE PARAMETERS ==========")
+        
+
         trainable_params = []
         total_params = 0
         trainable_count = 0
@@ -950,9 +928,11 @@ def main():
         
     config_suffix = f"lr-{training_args.learning_rate}_r-{lora_rank}_alpha-{lora_alpha}"
     hf_repo_id = f"{hf_repo_id}_{config_suffix}"
-
+    
+    # You can push the fined model checkpoint to hf
     # model.push_to_hub(hf_repo_id, use_auth_token=hf_write_token)
 
+    # remove the pruning mask 
     for name, module in model.named_modules():
         if hasattr(module, "mask"):
             delattr(module, "mask")
