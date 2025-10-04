@@ -26,27 +26,30 @@ pip install -e peft
 
 # Log in to Hugging Face for model and dataset access:
 huggingface-cli login
-
+```
 
 ## 2. Training
 
 We support fine-tuning with different datasets and pruning strategies.
 
+```
 # Training datasets
-# Option 1: MetaMathQA
+# MetaMathQA
 dataset_name="meta-math/MetaMathQA"
 dataset_config_name=None
 
-# Option 2: Code-Feedback
+# Code-Feedback
 dataset_name="HuggingFaceH4/Code-Feedback"
 dataset_config_name="default"
 
+bash run_main_mc.sh
+```
 
 ## 3. Inference & Evaluation
 
 We use[lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) for evaluation.
 
-
+```
 git clone https://github.com/EleutherAI/lm-evaluation-harness.git
 cd lm-evaluation-harness
 
@@ -60,13 +63,13 @@ Run evaluation
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 lm_eval \
   --model hf \
   --tasks humaneval \
-  --model_args "pretrained=meta-llama/Meta-Llama-3-8B,tokenizer=meta-llama/Meta-Llama-3-8B,peft=/opt/tiger/mariana/llmeval/checkpoints/codefeedback/1e-5_alpha64_gradient_based_pruning_m2_64,dtype=bfloat16,parallelize=True" \
+  --model_args "pretrained=meta-llama/Meta-Llama-3-8B,tokenizer=meta-llama/Meta-Llama-3-8B,peft=your_LoRA_checkpoint,dtype=bfloat16,parallelize=True" \
   --batch_size 8 \
-  --output_path results/5e-5_adamw_pruning_256.json \
+  --output_path results/output_filename.json \
   --log_samples \
   --verbosity DEBUG \
   --confirm_run_unsafe_code
-
+```
 
 
 
