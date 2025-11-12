@@ -12,7 +12,6 @@ from transformers.trainer import (
     PreTrainedTokenizerBase,
     TrainerCallback,
 )
-from lora_rite import LoRARite
 import torch
 import torch.optim as optim
 from peft.tuners.lora.layer import Linear as LoraLinear
